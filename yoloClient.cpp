@@ -1,412 +1,262 @@
-#ifndef YOLOCLIENT_YOLOCLIENT_CPP
-#define YOLOCLIENT_YOLOCLIENT_CPP
-
-#include <pylike/argparse.h>
-#include <dds/message/yolo/Objects.h>
-#include <dds/pubsub/DDSPublisher.h>
-#include <dds/conversion/opencv.h>
-
-#include <opencv2/opencv.hpp>
-
-#include "videoEncDec/opencv/capture.h"
-#include "privateVideo/privateVideoTransfer.h"
-
-
-#define nh lightdds::nodeHandle
-
-argparse::ArgumentParser getArgs(int argc, char** argv)
-{
-    argparse::ArgumentParser parser("yoloClient_yoloClient parser", argc, argv);
-    parser.add_argument({"-n", "--node-name"}, "yoloClient_node", "this node name");
-    parser.add_argument({"--topic-name"}, "/camera/result", "topic name");
-    parser.add_argument({"-i", "--ip"}, "127.0.0.1", "server ip");
-    parser.add_argument({"-p", "--port"}, 21000, "server port");
-    parser.add_argument({"--buffer-size"}, 5, "publisher max buffer size");
-    parser.add_argument({"--debug"}, STORE_TRUE, "use debug mode");  // bool
-    parser.add_argument({"--source"}, "/path/to/your/video", "video file path");
-    parser.add_argument({"--drop"}, STORE_TRUE, "drop frame");
-    parser.add_argument({"-t", "--type"}, "normal", "video type, normal/jpeg/yuyv/stream");
-    parser.add_argument({"--send-image"}, STORE_TRUE, "send image");
-    logaddAndSetFromParser2(parser);
-    logsetStdoutFormat(((bool)parser["debug"])?"$TIME | $LEVEL | $LOCATION - $MSG":"$TIME | $MSG");
-    return parser;
-}
-
-
-static inline cv::Mat static_resize(const cv::Mat& img, cv::Size input_size, float& r) {
-    if (img.size().width == input_size.width && img.size().height == input_size.height)
-    {
-        r = 1.0;
-        return img;
-    }
-    r = std::min(input_size.width / (img.cols*1.0), input_size.height / (img.rows*1.0));
-    int unpad_w = r * img.cols;
-    int unpad_h = r * img.rows;
-
-    cv::Mat re(unpad_h, unpad_w, CV_8UC3);
-    cv::resize(img, re, re.size(), 0, 0, cv::INTER_LINEAR);
-    cv::Mat out(input_size.height, input_size.width, CV_8UC3, cv::Scalar(114, 114, 114));
-    re.copyTo(out(cv::Rect(0, 0, re.cols, re.rows)));
-    return out;
-}
-
-class YOLOClient
-{
-public:
-    YOLOClient() {}
-
-    YOLOClient(std::string ip, int port): ip_(ip), port_(port)
-    {
-        client_.init(ip, port, true);
-        
-    }
-
-    int connect(int delay=1, int times=0)
-    {
-        while (0 != client_.connectServer())
-        {
-            WARN << "connect server failed, try again" << ENDL;
-            client_.init(ip_, port_);
-            if (delay) sleep(delay);
-            if (--times == 0) return -1;
-        }
-
-        // INFO << 1 << ENDL;
-        client_.recvData(&input_size.width, sizeof(int));
-        // INFO << 2 << ENDL;
-        client_.recvData(&input_size.height, sizeof(int));
-        // INFO << 3 << ENDL;
-        
-        names_.clear();
-        int length_names=0;
-        // INFO << 4 << ENDL;
-        client_.recvData(&length_names, sizeof(int));
-        char* names = new char[length_names];
-        // INFO << 5 << ENDL;
-        client_.recvData(names, length_names);
-        // INFO << 6 << ENDL;
-        pystring names_str(names);
-        names_ = names_str.split(",");
-        // for (auto name: names_)
-        // {
-        //     printf("%s\n", name.c_str());
-        // }
-        return 0;
-    }
-
-    bool isConnected()
-    {
-        return client_.isConnect();
-    }
-
-    void pushImg(cv::Mat& img)
-    {
-        float ratio = 1.0;
-        cv::Mat frame_resize = static_resize(img, input_size, ratio);
-        imgs.push(img);
-        ratios.push(ratio);
-        client_.sendData(frame_resize.data, frame_resize.total() * frame_resize.elemSize());
-    }
-
-
-    std::vector<std::vector<float>> getResult(cv::Mat& img, bool draw_box=false)
-    {
-        int numResults = 0;
-        std::vector<std::vector<float>> result;
-        std::vector<float> result2recv;
-        int ret = client_.recvData(&numResults, sizeof(int));
-        if (ret != 0) return result;
-        
-        img = imgs.front();
-        // std::cout << img.size() << std::endl;
-        imgs.pop();
-        float ratio = ratios.front();
-        ratios.pop();
-
-        
-        if (numResults)
-        {
-            result.resize(numResults);
-            result2recv.resize(numResults * 6);
-            INFO << 5 << ENDL;
-            client_.recvData(result2recv.data(), 6 * sizeof(float) * numResults);
-            INFO << 6 << ENDL;
-            
-            for (int i=0;i<numResults;i++)
-            {
-                result[i].resize(6);
-                for (int j=0;j<6;j++)
-                {
-                    result[i][j] = result2recv[i * 6 + j];
-                    if (j < 4)
-                    {
-                        result[i][j] /= ratio;
-                    }
-                }
-            }
-            if (draw_box)
-            {
-                draw(img, result);
-            }
-        }
-        
-        return result;
-    }
-
-    std::vector<std::vector<float>> detect(cv::Mat& frame, bool draw_box=false)
-    {
-        float ratio = 1.0; // std::min((float)input_size.width / frame.cols, (float)input_size.height / frame.rows);
-
-        cv::Mat frame_resize = static_resize(frame, input_size, ratio);
-
-        // INFO << ratio << ENDL;
-
-        // cv::resize(frame, frame_resize, input_size);
-        client_.sendData(frame_resize.data, frame_resize.total() * frame_resize.elemSize());
-
-        int numResults = 0;
-        client_.recvData(&numResults, sizeof(int));
-        std::vector<std::vector<float>> result;
-        std::vector<float> result2recv;
-        
-        if (numResults)
-        {
-            result.resize(numResults);
-            result2recv.resize(numResults * 6);
-            client_.recvData(result2recv.data(), 6 * sizeof(float) * numResults);
-            
-            for (int i=0;i<numResults;i++)
-            {
-                result[i].resize(6);
-                for (int j=0;j<6;j++)
-                {
-                    result[i][j] = result2recv[i * 6 + j];
-                    if (j < 4)
-                    {
-                        result[i][j] /= ratio;
-                    }
-                }
-            }
-            if (draw_box)
-            {
-                draw(frame, result);
-            }
-        }
-        
-        return result;
-    }
-
-    void close()
-    {
-        client_.closeClient();
-    }
-
-private:
-    cv::Size input_size;
-    std::vector<pystring> names_;
-    std::string ip_;
-    privateVideo::Client client_;
-    std::queue<cv::Mat> imgs;
-    std::queue<float> ratios;
-    int port_ = 0;
-    void* cap_=nullptr;
-
-    static cv::Scalar get_color(int index){
-        static const int color_list[][3] = {
-            {255, 56, 56},{255, 157, 151},{255, 112, 31},{255, 178, 29},{207, 210, 49},
-            {72, 249, 10},{146, 204, 23},{61, 219, 134},{26, 147, 52},{0, 212, 187},
-            {44, 153, 168},{0, 194, 255},{52, 69, 147},{100, 115, 255},{0, 24, 236},
-            {132, 56, 255},{82, 0, 133},{203, 56, 255},{255, 149, 200},{255, 55, 198}
-        };
-        index %= 20;
-        return cv::Scalar(color_list[index][2], color_list[index][1], color_list[index][0]);
-    }
-
-
-    void draw(cv::Mat& dist, std::vector<std::vector<float>> prediction, bool draw_label=true, int thickness=20)
-    {
-        cv::Scalar color;
-        cv::Scalar txt_color;
-        cv::Scalar txt_bk_color;
-
-        cv::Size label_size;
-
-        int baseLine = 0;
-        int x1, y1, x2, y2, out_point_y;
-        int line_thickness = std::round((double)thickness / 10.0);
-        
-        for(int k=0; k<prediction.size(); k++){
-            int label_ = (int)prediction.at(k)[4];
-            color = get_color(label_);
-
-            x1 = prediction.at(k)[0];
-            y1 = prediction.at(k)[1];
-            x2 = prediction.at(k)[2];
-            y2 = prediction.at(k)[3];
-
-            cv::rectangle(
-                dist,
-                cv::Rect2f(x1, y1, x2-x1, y2-y1),
-                color,
-                line_thickness
-            );
-            
-            if (draw_label){
-                txt_color = (cv::mean(color)[0] > 127)?cv::Scalar(0, 0, 0):cv::Scalar(255, 255, 255);
-                std::string label = names_.at(label_) + " " + std::to_string(prediction.at(k)[5]).substr(0, 4);
-                label_size = cv::getTextSize(label.c_str(), cv::LINE_AA, double(thickness) / 30.0, (line_thickness>1)?line_thickness-1:1, &baseLine);
-                txt_bk_color = color; // * 0.7;
-                y1 = (y1 > dist.rows)?dist.rows:y1 + 1;
-                out_point_y = y1 - label_size.height - baseLine;
-                if (out_point_y >= 0) y1 = out_point_y;
-                cv::rectangle(dist, cv::Rect(cv::Point(x1 - (line_thickness - 1), y1), cv::Size(label_size.width, label_size.height + baseLine)),
-                            txt_bk_color, -1);
-                cv::putText(dist, label, cv::Point(x1, y1 + label_size.height),
-                            cv::LINE_AA, double(thickness) / 30.0, txt_color, (line_thickness>1)?line_thickness-1:1);
-            }
-
-        }
-    }
-};
-
-void pushThread(BaseCapture* cap, YOLOClient* client, bool* stop_)
-{
-    while (cap->isOpened() && !*stop_)
-    {
-        cv::Mat frame;
-        *cap >> frame;
-        if (frame.empty()) 
-        {
-            *stop_ = true;
-            break;
-        }
-        INFO << "push" << ENDL;
-        client->pushImg(frame);
-    }
-}
-
-
-int main(int argc, char** argv)
-{
-    // init params
-    auto args = getArgs(argc, argv);
-    std::string node_name = args["node-name"];
-    std::string topic_name = args["topic-name"];
-    int max_buffer_size = args["buffer-size"];
-    bool debug = args["debug"];
-    std::string source = args["source"];
-    std::string sourceType = args["type"];
-    bool drop = args["drop"];
-    bool send_image = args["send-image"];
-
-    YOLOClient client(args["ip"], args["port"]);
-    client.connect();
-    
-    int type = 0;
-    if (sourceType == "normal")
-    {
-        type = Capture::CAP_TYPE_NORMAL;
-    }
-    else if (sourceType == "jpeg")
-    {
-        type = Capture::CAP_TYPE_JPEG;
-    }
-    else if (sourceType == "yuyv")
-    {
-        type = Capture::CAP_TYPE_YUYV;
-    }
-    else if (sourceType == "stream")
-    {
-        type = Capture::CAP_TYPE_STREAM;
-    }
-    else
-    {
-        ERROR << "unknown source type: " << sourceType << ENDL;
-        return -1;
-    }
-    BaseCapture* cap = Capture::createCapture(source, cv::CAP_ANY, type, drop);
-    // cv::VideoCapture cap(source);
-    if (sourceType == "jpeg" || sourceType == "normal")
-    {
-        cap->set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-        cap->set(cv::CAP_PROP_FPS, 30);
-        cap->set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        cap->set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    }
-    
-
-    lightdds::DDSPublisher* pub = nh::advertise<yolo::Objects>(topic_name, max_buffer_size, "yoloClient_pub_node1");
-
-    if (!cap->isOpened())
-    {
-        ERROR << "can not open " << source << ENDL;
-        return -1;
-    }
-    INFO << "fps:" << cap->get(cv::CAP_PROP_FPS) << ENDL;
-    cv::Mat frame;
-    bool stop = false;
-    
-    INFO << 1 << ENDL;
-
-    std::thread pushT(&pushThread, cap, &client, &stop);
-
-    INFO << 2 << ENDL;
-    yolo::Object obj;
-    yolo::Objects msg;
-    msg.header.frame_id = topic_name;
-
-    msg.image_width = cap->get(cv::CAP_PROP_FRAME_WIDTH);
-    msg.image_height = cap->get(cv::CAP_PROP_FRAME_HEIGHT);
-    msg.send_image = send_image;
-    dds_conversion::EncodeParams params;
-    params.encoding_type = dds_conversion::ENCODE_TYPE_JPEG;
-    params.image_quality = 90;
-
-    
-
-    uint64_t count = 0;
-    while (cap->isOpened() && client.isConnected() && !stop)
-    {
-        auto t0 = pytime::time();
-
-        
-        INFO << "get result" << ENDL;
-        auto result = client.getResult(frame, true);
-        INFO << "get result done" << ENDL;
-
-        msg.objects.clear();
-        
-        for (auto r: result)
-        {
-            obj.x = r[0];
-            obj.y = r[1];
-            obj.width = r[2] - r[0];
-            obj.height = r[3] - r[1];
-            obj.label = r[4];
-            obj.confidence = r[5];
-            msg.objects.push_back(obj);
-        }
-        if (send_image)
-        {
-            dds_conversion::fromOpenCVMat(frame, msg.image, params);
-        }
-        msg.image_id = count++;
-        pub->publish(msg);
-
-
-        double dt = pytime::time() - t0;
-        INFO << "detect time:" << dt << "s" << ENDL;
-
-    }
-    cv::destroyAllWindows();
-    stop = true;
-    pushT.join();
-    cap->release();
-    client.close();
-    
-    return 0;
-}
-
-
-#endif /* YOLOCLIENT_YOLOCLIENT_CPP */
-
+linux-vdso.so.1 (0x0000007f80921000)
+	libLightDDSLib.so => /usr/local/lightdds/lib/aarch64/libLightDDSLib.so (0x0000007f802fd000)
+	libcodec_ffmpeg.so => /usr/local/lib/libcodec_ffmpeg.so (0x0000007f802da000)
+	libjpeg.so.8 => /lib/aarch64-linux-gnu/libjpeg.so.8 (0x0000007f8024d000)
+	libopencv_highgui.so.4.2 => /lib/aarch64-linux-gnu/libopencv_highgui.so.4.2 (0x0000007f80228000)
+	libopencv_videoio.so.4.2 => /lib/aarch64-linux-gnu/libopencv_videoio.so.4.2 (0x0000007f801af000)
+	libopencv_imgcodecs.so.4.2 => /lib/aarch64-linux-gnu/libopencv_imgcodecs.so.4.2 (0x0000007f80155000)
+	libopencv_imgproc.so.4.2 => /lib/aarch64-linux-gnu/libopencv_imgproc.so.4.2 (0x0000007f7fdc3000)
+	libopencv_core.so.4.2 => /lib/aarch64-linux-gnu/libopencv_core.so.4.2 (0x0000007f7fb16000)
+	libstdc++.so.6 => /lib/aarch64-linux-gnu/libstdc++.so.6 (0x0000007f7f931000)
+	libm.so.6 => /lib/aarch64-linux-gnu/libm.so.6 (0x0000007f7f886000)
+	libgcc_s.so.1 => /lib/aarch64-linux-gnu/libgcc_s.so.1 (0x0000007f7f862000)
+	libpthread.so.0 => /lib/aarch64-linux-gnu/libpthread.so.0 (0x0000007f7f831000)
+	libc.so.6 => /lib/aarch64-linux-gnu/libc.so.6 (0x0000007f7f6be000)
+	/lib/ld-linux-aarch64.so.1 (0x0000007f808f1000)
+	libQt5Core.so.5 => /usr/local/lightdds/lib/aarch64/libQt5Core.so.5 (0x0000007f7f18f000)
+	libstreamAPI.so => /usr/local/lib/libstreamAPI.so (0x0000007f7f17c000)
+	libavcodec.so.60 => /usr/local/lib/libavcodec.so.60 (0x0000007f7e126000)
+	libavutil.so.58 => /usr/local/lib/libavutil.so.58 (0x0000007f7d056000)
+	libswscale.so.7 => /usr/local/lib/libswscale.so.7 (0x0000007f7cfe4000)
+	libgtk-3.so.0 => /lib/aarch64-linux-gnu/libgtk-3.so.0 (0x0000007f7c80c000)
+	libgdk-3.so.0 => /lib/aarch64-linux-gnu/libgdk-3.so.0 (0x0000007f7c6fb000)
+	libcairo.so.2 => /lib/aarch64-linux-gnu/libcairo.so.2 (0x0000007f7c5dd000)
+	libgdk_pixbuf-2.0.so.0 => /lib/aarch64-linux-gnu/libgdk_pixbuf-2.0.so.0 (0x0000007f7c5a8000)
+	libgobject-2.0.so.0 => /lib/aarch64-linux-gnu/libgobject-2.0.so.0 (0x0000007f7c536000)
+	libglib-2.0.so.0 => /lib/aarch64-linux-gnu/libglib-2.0.so.0 (0x0000007f7c3fb000)
+	libdl.so.2 => /lib/aarch64-linux-gnu/libdl.so.2 (0x0000007f7c3e7000)
+	libdc1394.so.22 => /lib/aarch64-linux-gnu/libdc1394.so.22 (0x0000007f7c361000)
+	libgstreamer-1.0.so.0 => /lib/aarch64-linux-gnu/libgstreamer-1.0.so.0 (0x0000007f7c204000)
+	libgstapp-1.0.so.0 => /lib/aarch64-linux-gnu/libgstapp-1.0.so.0 (0x0000007f7c1e5000)
+	libgstriff-1.0.so.0 => /lib/aarch64-linux-gnu/libgstriff-1.0.so.0 (0x0000007f7c1c7000)
+	libgstpbutils-1.0.so.0 => /lib/aarch64-linux-gnu/libgstpbutils-1.0.so.0 (0x0000007f7c17c000)
+	libavcodec.so.58 => /usr/local/externLibs/libavcodec.so.58 (0x0000007f7ae33000)
+	libavformat.so.58 => /usr/local/externLibs/libavformat.so.58 (0x0000007f7abbd000)
+	libavutil.so.56 => /usr/local/externLibs/libavutil.so.56 (0x0000007f7aa93000)
+	libswscale.so.5 => /usr/local/externLibs/libswscale.so.5 (0x0000007f7aa0e000)
+	libwebp.so.6 => /lib/aarch64-linux-gnu/libwebp.so.6 (0x0000007f7a9ad000)
+	libpng16.so.16 => /lib/aarch64-linux-gnu/libpng16.so.16 (0x0000007f7a969000)
+	libgdcmMSFF.so.3.0 => /lib/aarch64-linux-gnu/libgdcmMSFF.so.3.0 (0x0000007f7a70f000)
+	libtiff.so.5 => /lib/aarch64-linux-gnu/libtiff.so.5 (0x0000007f7a685000)
+	libIlmImf-2_3.so.24 => /lib/aarch64-linux-gnu/libIlmImf-2_3.so.24 (0x0000007f7a3b8000)
+	libgdal.so.26 => /lib/libgdal.so.26 (0x0000007f791d2000)
+	libgdcmDSED.so.3.0 => /lib/aarch64-linux-gnu/libgdcmDSED.so.3.0 (0x0000007f790ae000)
+	libz.so.1 => /lib/aarch64-linux-gnu/libz.so.1 (0x0000007f79084000)
+	libtbb.so.2 => /lib/aarch64-linux-gnu/libtbb.so.2 (0x0000007f79044000)
+	libicui18n.so.66 => /lib/aarch64-linux-gnu/libicui18n.so.66 (0x0000007f78d52000)
+	libicuuc.so.66 => /lib/aarch64-linux-gnu/libicuuc.so.66 (0x0000007f78b65000)
+	libpcre2-16.so.0 => /lib/aarch64-linux-gnu/libpcre2-16.so.0 (0x0000007f78ae1000)
+	libdouble-conversion.so.3 => /lib/aarch64-linux-gnu/libdouble-conversion.so.3 (0x0000007f78abe000)
+	libswresample.so.4 => /usr/local/lib/libswresample.so.4 (0x0000007f78a98000)
+	liblzma.so.5 => /lib/aarch64-linux-gnu/liblzma.so.5 (0x0000007f78a62000)
+	libx264.so.164 => /usr/local/lib/libx264.so.164 (0x0000007f787d4000)
+	libx265.so.215 => /usr/local/lib/libx265.so.215 (0x0000007f784dd000)
+	librockchip_mpp.so.1 => /usr/local/lib/librockchip_mpp.so.1 (0x0000007f78296000)
+	libdrm.so.2 => /lib/aarch64-linux-gnu/libdrm.so.2 (0x0000007f78274000)
+	libgmodule-2.0.so.0 => /lib/aarch64-linux-gnu/libgmodule-2.0.so.0 (0x0000007f7825e000)
+	libpangocairo-1.0.so.0 => /lib/aarch64-linux-gnu/libpangocairo-1.0.so.0 (0x0000007f78240000)
+	libX11.so.6 => /lib/aarch64-linux-gnu/libX11.so.6 (0x0000007f780fb000)
+	libXi.so.6 => /lib/aarch64-linux-gnu/libXi.so.6 (0x0000007f780db000)
+	libXfixes.so.3 => /lib/aarch64-linux-gnu/libXfixes.so.3 (0x0000007f780c5000)
+	libcairo-gobject.so.2 => /lib/aarch64-linux-gnu/libcairo-gobject.so.2 (0x0000007f780ab000)
+	libatk-1.0.so.0 => /lib/aarch64-linux-gnu/libatk-1.0.so.0 (0x0000007f7806f000)
+	libatk-bridge-2.0.so.0 => /lib/aarch64-linux-gnu/libatk-bridge-2.0.so.0 (0x0000007f7802c000)
+	libepoxy.so.0 => /lib/aarch64-linux-gnu/libepoxy.so.0 (0x0000007f77ed7000)
+	libfribidi.so.0 => /lib/aarch64-linux-gnu/libfribidi.so.0 (0x0000007f77eac000)
+	libgio-2.0.so.0 => /lib/aarch64-linux-gnu/libgio-2.0.so.0 (0x0000007f77caf000)
+	libpangoft2-1.0.so.0 => /lib/aarch64-linux-gnu/libpangoft2-1.0.so.0 (0x0000007f77c8a000)
+	libpango-1.0.so.0 => /lib/aarch64-linux-gnu/libpango-1.0.so.0 (0x0000007f77c2c000)
+	libharfbuzz.so.0 => /lib/aarch64-linux-gnu/libharfbuzz.so.0 (0x0000007f77b2e000)
+	libfontconfig.so.1 => /lib/aarch64-linux-gnu/libfontconfig.so.1 (0x0000007f77ad9000)
+	libfreetype.so.6 => /lib/aarch64-linux-gnu/libfreetype.so.6 (0x0000007f77a1a000)
+	libXinerama.so.1 => /lib/aarch64-linux-gnu/libXinerama.so.1 (0x0000007f77a07000)
+	libXrandr.so.2 => /lib/aarch64-linux-gnu/libXrandr.so.2 (0x0000007f779ea000)
+	libXcursor.so.1 => /lib/aarch64-linux-gnu/libXcursor.so.1 (0x0000007f779d0000)
+	libXcomposite.so.1 => /lib/aarch64-linux-gnu/libXcomposite.so.1 (0x0000007f779bd000)
+	libXdamage.so.1 => /lib/aarch64-linux-gnu/libXdamage.so.1 (0x0000007f779aa000)
+	libxkbcommon.so.0 => /lib/aarch64-linux-gnu/libxkbcommon.so.0 (0x0000007f7795b000)
+	libwayland-cursor.so.0 => /lib/aarch64-linux-gnu/libwayland-cursor.so.0 (0x0000007f77943000)
+	libwayland-egl.so.1 => /usr/lib/aarch64-linux-gnu/mali/libwayland-egl.so.1 (0x0000007f7792f000)
+	libwayland-client.so.0 => /lib/aarch64-linux-gnu/libwayland-client.so.0 (0x0000007f77910000)
+	libXext.so.6 => /lib/aarch64-linux-gnu/libXext.so.6 (0x0000007f778ed000)
+	librt.so.1 => /lib/aarch64-linux-gnu/librt.so.1 (0x0000007f778d5000)
+	libpixman-1.so.0 => /lib/aarch64-linux-gnu/libpixman-1.so.0 (0x0000007f77866000)
+	libxcb-shm.so.0 => /lib/aarch64-linux-gnu/libxcb-shm.so.0 (0x0000007f77851000)
+	libxcb.so.1 => /lib/aarch64-linux-gnu/libxcb.so.1 (0x0000007f7781a000)
+	libxcb-render.so.0 => /lib/aarch64-linux-gnu/libxcb-render.so.0 (0x0000007f777fc000)
+	libXrender.so.1 => /lib/aarch64-linux-gnu/libXrender.so.1 (0x0000007f777e3000)
+	libffi.so.7 => /lib/aarch64-linux-gnu/libffi.so.7 (0x0000007f777ca000)
+	libpcre.so.3 => /lib/aarch64-linux-gnu/libpcre.so.3 (0x0000007f77756000)
+	libraw1394.so.11 => /lib/aarch64-linux-gnu/libraw1394.so.11 (0x0000007f7773a000)
+	libusb-1.0.so.0 => /lib/aarch64-linux-gnu/libusb-1.0.so.0 (0x0000007f77710000)
+	libunwind.so.8 => /lib/aarch64-linux-gnu/libunwind.so.8 (0x0000007f776bc000)
+	libgstbase-1.0.so.0 => /lib/aarch64-linux-gnu/libgstbase-1.0.so.0 (0x0000007f77637000)
+	libgstaudio-1.0.so.0 => /lib/aarch64-linux-gnu/libgstaudio-1.0.so.0 (0x0000007f775b2000)
+	libgsttag-1.0.so.0 => /lib/aarch64-linux-gnu/libgsttag-1.0.so.0 (0x0000007f77566000)
+	libgstvideo-1.0.so.0 => /lib/aarch64-linux-gnu/libgstvideo-1.0.so.0 (0x0000007f774b0000)
+	libswresample.so.3 => /usr/local/externLibs/libswresample.so.3 (0x0000007f77488000)
+	libvpx.so.6 => /lib/aarch64-linux-gnu/libvpx.so.6 (0x0000007f772b6000)
+	libwebpmux.so.3 => /lib/aarch64-linux-gnu/libwebpmux.so.3 (0x0000007f7729b000)
+	librsvg-2.so.2 => /lib/aarch64-linux-gnu/librsvg-2.so.2 (0x0000007f76a6f000)
+	libzvbi.so.0 => /lib/aarch64-linux-gnu/libzvbi.so.0 (0x0000007f769d7000)
+	libsnappy.so.1 => /lib/aarch64-linux-gnu/libsnappy.so.1 (0x0000007f769be000)
+	libaom.so.0 => /lib/aarch64-linux-gnu/libaom.so.0 (0x0000007f766ac000)
+	libcodec2.so.0.9 => /lib/aarch64-linux-gnu/libcodec2.so.0.9 (0x0000007f758c1000)
+	libgsm.so.1 => /lib/aarch64-linux-gnu/libgsm.so.1 (0x0000007f758a4000)
+	libmp3lame.so.0 => /lib/aarch64-linux-gnu/libmp3lame.so.0 (0x0000007f75824000)
+	libopenjp2.so.7 => /lib/aarch64-linux-gnu/libopenjp2.so.7 (0x0000007f757c4000)
+	libopus.so.0 => /lib/aarch64-linux-gnu/libopus.so.0 (0x0000007f75763000)
+	libshine.so.3 => /lib/aarch64-linux-gnu/libshine.so.3 (0x0000007f75749000)
+	libspeex.so.1 => /lib/aarch64-linux-gnu/libspeex.so.1 (0x0000007f75721000)
+	libtheoraenc.so.1 => /lib/aarch64-linux-gnu/libtheoraenc.so.1 (0x0000007f756de000)
+	libtheoradec.so.1 => /lib/aarch64-linux-gnu/libtheoradec.so.1 (0x0000007f756b5000)
+	libtwolame.so.0 => /lib/aarch64-linux-gnu/libtwolame.so.0 (0x0000007f75683000)
+	libvorbis.so.0 => /lib/aarch64-linux-gnu/libvorbis.so.0 (0x0000007f7564a000)
+	libvorbisenc.so.2 => /lib/aarch64-linux-gnu/libvorbisenc.so.2 (0x0000007f7559a000)
+	libwavpack.so.1 => /lib/aarch64-linux-gnu/libwavpack.so.1 (0x0000007f75565000)
+	libx264.so.155 => /lib/aarch64-linux-gnu/libx264.so.155 (0x0000007f75311000)
+	libx265.so.179 => /lib/aarch64-linux-gnu/libx265.so.179 (0x0000007f75054000)
+	libxvidcore.so.4 => /lib/aarch64-linux-gnu/libxvidcore.so.4 (0x0000007f74f63000)
+	libva.so.2 => /lib/aarch64-linux-gnu/libva.so.2 (0x0000007f74f2d000)
+	libxml2.so.2 => /lib/aarch64-linux-gnu/libxml2.so.2 (0x0000007f74d77000)
+	libbz2.so.1.0 => /lib/aarch64-linux-gnu/libbz2.so.1.0 (0x0000007f74d54000)
+	libgme.so.0 => /lib/aarch64-linux-gnu/libgme.so.0 (0x0000007f74d00000)
+	libopenmpt.so.0 => /lib/aarch64-linux-gnu/libopenmpt.so.0 (0x0000007f74b31000)
+	libchromaprint.so.1 => /lib/aarch64-linux-gnu/libchromaprint.so.1 (0x0000007f74b0f000)
+	libbluray.so.2 => /lib/aarch64-linux-gnu/libbluray.so.2 (0x0000007f74ab4000)
+	libgnutls.so.30 => /lib/aarch64-linux-gnu/libgnutls.so.30 (0x0000007f748c2000)
+	libssh-gcrypt.so.4 => /lib/aarch64-linux-gnu/libssh-gcrypt.so.4 (0x0000007f74829000)
+	libva-drm.so.2 => /lib/aarch64-linux-gnu/libva-drm.so.2 (0x0000007f74816000)
+	libva-x11.so.2 => /lib/aarch64-linux-gnu/libva-x11.so.2 (0x0000007f74800000)
+	libvdpau.so.1 => /lib/aarch64-linux-gnu/libvdpau.so.1 (0x0000007f747ec000)
+	libOpenCL.so.1 => /lib/aarch64-linux-gnu/libOpenCL.so.1 (0x0000007f747d3000)
+	libgdcmDICT.so.3.0 => /lib/aarch64-linux-gnu/libgdcmDICT.so.3.0 (0x0000007f74507000)
+	libgdcmjpeg8.so.3.0 => /lib/aarch64-linux-gnu/libgdcmjpeg8.so.3.0 (0x0000007f744d0000)
+	libgdcmjpeg12.so.3.0 => /lib/aarch64-linux-gnu/libgdcmjpeg12.so.3.0 (0x0000007f74499000)
+	libgdcmjpeg16.so.3.0 => /lib/aarch64-linux-gnu/libgdcmjpeg16.so.3.0 (0x0000007f74462000)
+	libCharLS.so.2 => /lib/aarch64-linux-gnu/libCharLS.so.2 (0x0000007f7440b000)
+	libuuid.so.1 => /lib/aarch64-linux-gnu/libuuid.so.1 (0x0000007f743f4000)
+	libjson-c.so.4 => /lib/aarch64-linux-gnu/libjson-c.so.4 (0x0000007f743d2000)
+	libgdcmIOD.so.3.0 => /lib/aarch64-linux-gnu/libgdcmIOD.so.3.0 (0x0000007f743ad000)
+	libgdcmCommon.so.3.0 => /lib/aarch64-linux-gnu/libgdcmCommon.so.3.0 (0x0000007f7437a000)
+	libzstd.so.1 => /lib/aarch64-linux-gnu/libzstd.so.1 (0x0000007f742d9000)
+	libjbig.so.0 => /lib/aarch64-linux-gnu/libjbig.so.0 (0x0000007f742bc000)
+	libHalf.so.24 => /lib/aarch64-linux-gnu/libHalf.so.24 (0x0000007f74267000)
+	libIex-2_3.so.24 => /lib/aarch64-linux-gnu/libIex-2_3.so.24 (0x0000007f74237000)
+	libIlmThread-2_3.so.24 => /lib/aarch64-linux-gnu/libIlmThread-2_3.so.24 (0x0000007f7421f000)
+	libarmadillo.so.9 => /lib/libarmadillo.so.9 (0x0000007f74200000)
+	libpoppler.so.97 => /lib/aarch64-linux-gnu/libpoppler.so.97 (0x0000007f73ed1000)
+	libfreexl.so.1 => /lib/aarch64-linux-gnu/libfreexl.so.1 (0x0000007f73eb8000)
+	libqhull.so.7 => /lib/aarch64-linux-gnu/libqhull.so.7 (0x0000007f73e58000)
+	libgeos_c.so.1 => /lib/aarch64-linux-gnu/libgeos_c.so.1 (0x0000007f73e0a000)
+	libepsilon.so.1 => /lib/aarch64-linux-gnu/libepsilon.so.1 (0x0000007f73de3000)
+	libodbc.so.2 => /lib/aarch64-linux-gnu/libodbc.so.2 (0x0000007f73d6a000)
+	libodbcinst.so.2 => /lib/aarch64-linux-gnu/libodbcinst.so.2 (0x0000007f73d43000)
+	libkmlbase.so.1 => /lib/aarch64-linux-gnu/libkmlbase.so.1 (0x0000007f73d19000)
+	libkmldom.so.1 => /lib/aarch64-linux-gnu/libkmldom.so.1 (0x0000007f73c76000)
+	libkmlengine.so.1 => /lib/aarch64-linux-gnu/libkmlengine.so.1 (0x0000007f73c33000)
+	libexpat.so.1 => /lib/aarch64-linux-gnu/libexpat.so.1 (0x0000007f73bfc000)
+	libxerces-c-3.2.so => /lib/aarch64-linux-gnu/libxerces-c-3.2.so (0x0000007f73886000)
+	libnetcdf.so.15 => /lib/aarch64-linux-gnu/libnetcdf.so.15 (0x0000007f73757000)
+	libhdf5_serial.so.103 => /lib/aarch64-linux-gnu/libhdf5_serial.so.103 (0x0000007f733ab000)
+	libmfhdfalt.so.0 => /lib/libmfhdfalt.so.0 (0x0000007f73371000)
+	libdfalt.so.0 => /lib/libdfalt.so.0 (0x0000007f732b9000)
+	libogdi.so.4.1 => /lib/libogdi.so.4.1 (0x0000007f7328f000)
+	libgif.so.7 => /lib/aarch64-linux-gnu/libgif.so.7 (0x0000007f73276000)
+	libgeotiff.so.5 => /lib/aarch64-linux-gnu/libgeotiff.so.5 (0x0000007f73233000)
+	libcfitsio.so.8 => /lib/aarch64-linux-gnu/libcfitsio.so.8 (0x0000007f72f4b000)
+	libpq.so.5 => /lib/aarch64-linux-gnu/libpq.so.5 (0x0000007f72eec000)
+	libproj.so.15 => /lib/aarch64-linux-gnu/libproj.so.15 (0x0000007f72c28000)
+	libdapclient.so.6 => /lib/aarch64-linux-gnu/libdapclient.so.6 (0x0000007f72bda000)
+	libdap.so.25 => /lib/aarch64-linux-gnu/libdap.so.25 (0x0000007f72a4f000)
+	libspatialite.so.7 => /lib/aarch64-linux-gnu/libspatialite.so.7 (0x0000007f72518000)
+	libcurl-gnutls.so.4 => /lib/aarch64-linux-gnu/libcurl-gnutls.so.4 (0x0000007f72485000)
+	libfyba.so.0 => /lib/aarch64-linux-gnu/libfyba.so.0 (0x0000007f7241f000)
+	libmysqlclient.so.21 => /lib/aarch64-linux-gnu/libmysqlclient.so.21 (0x0000007f71d0c000)
+	libcrypto.so.1.1 => /lib/aarch64-linux-gnu/libcrypto.so.1.1 (0x0000007f71a7a000)
+	libicudata.so.66 => /lib/aarch64-linux-gnu/libicudata.so.66 (0x0000007f6ffab000)
+	libnuma.so.1 => /lib/aarch64-linux-gnu/libnuma.so.1 (0x0000007f6ff8a000)
+	libdbus-1.so.3 => /lib/aarch64-linux-gnu/libdbus-1.so.3 (0x0000007f6ff2a000)
+	libatspi.so.0 => /lib/aarch64-linux-gnu/libatspi.so.0 (0x0000007f6fee5000)
+	libmount.so.1 => /lib/aarch64-linux-gnu/libmount.so.1 (0x0000007f6fe77000)
+	libselinux.so.1 => /lib/aarch64-linux-gnu/libselinux.so.1 (0x0000007f6fe3f000)
+	libresolv.so.2 => /lib/aarch64-linux-gnu/libresolv.so.2 (0x0000007f6fe17000)
+	libthai.so.0 => /lib/aarch64-linux-gnu/libthai.so.0 (0x0000007f6fdfe000)
+	libgraphite2.so.3 => /lib/aarch64-linux-gnu/libgraphite2.so.3 (0x0000007f6fdcc000)
+	libmali_hook.so.1 => /lib/aarch64-linux-gnu/libmali_hook.so.1 (0x0000007f6fdb9000)
+	libmali.so.1 => /lib/aarch64-linux-gnu/libmali.so.1 (0x0000007f68740000)
+	libXau.so.6 => /lib/aarch64-linux-gnu/libXau.so.6 (0x0000007f6872a000)
+	libXdmcp.so.6 => /lib/aarch64-linux-gnu/libXdmcp.so.6 (0x0000007f68714000)
+	libudev.so.1 => /lib/aarch64-linux-gnu/libudev.so.1 (0x0000007f686da000)
+	liborc-0.4.so.0 => /lib/aarch64-linux-gnu/liborc-0.4.so.0 (0x0000007f6864b000)
+	libsoxr.so.0 => /lib/aarch64-linux-gnu/libsoxr.so.0 (0x0000007f685e3000)
+	libogg.so.0 => /lib/aarch64-linux-gnu/libogg.so.0 (0x0000007f685c9000)
+	libmpg123.so.0 => /lib/aarch64-linux-gnu/libmpg123.so.0 (0x0000007f68569000)
+	libvorbisfile.so.3 => /lib/aarch64-linux-gnu/libvorbisfile.so.3 (0x0000007f68550000)
+	libp11-kit.so.0 => /lib/aarch64-linux-gnu/libp11-kit.so.0 (0x0000007f68402000)
+	libidn2.so.0 => /lib/aarch64-linux-gnu/libidn2.so.0 (0x0000007f683d4000)
+	libunistring.so.2 => /lib/aarch64-linux-gnu/libunistring.so.2 (0x0000007f6824b000)
+	libtasn1.so.6 => /lib/aarch64-linux-gnu/libtasn1.so.6 (0x0000007f68228000)
+	libnettle.so.7 => /lib/aarch64-linux-gnu/libnettle.so.7 (0x0000007f681e2000)
+	libhogweed.so.5 => /lib/aarch64-linux-gnu/libhogweed.so.5 (0x0000007f6819a000)
+	libgmp.so.10 => /lib/aarch64-linux-gnu/libgmp.so.10 (0x0000007f68112000)
+	libgcrypt.so.20 => /lib/aarch64-linux-gnu/libgcrypt.so.20 (0x0000007f68046000)
+	libgpg-error.so.0 => /lib/aarch64-linux-gnu/libgpg-error.so.0 (0x0000007f68016000)
+	libgssapi_krb5.so.2 => /lib/aarch64-linux-gnu/libgssapi_krb5.so.2 (0x0000007f67fbe000)
+	libblas.so.3 => /lib/aarch64-linux-gnu/libblas.so.3 (0x0000007f67f57000)
+	liblapack.so.3 => /lib/aarch64-linux-gnu/liblapack.so.3 (0x0000007f67a1a000)
+	libarpack.so.2 => /lib/aarch64-linux-gnu/libarpack.so.2 (0x0000007f679cf000)
+	libsuperlu.so.5 => /lib/aarch64-linux-gnu/libsuperlu.so.5 (0x0000007f67960000)
+	liblcms2.so.2 => /lib/aarch64-linux-gnu/liblcms2.so.2 (0x0000007f678f9000)
+	libnss3.so => /lib/aarch64-linux-gnu/libnss3.so (0x0000007f677b4000)
+	libsmime3.so => /lib/aarch64-linux-gnu/libsmime3.so (0x0000007f67777000)
+	libnspr4.so => /lib/aarch64-linux-gnu/libnspr4.so (0x0000007f67728000)
+	libgeos-3.8.0.so => /lib/aarch64-linux-gnu/libgeos-3.8.0.so (0x0000007f67573000)
+	libltdl.so.7 => /lib/aarch64-linux-gnu/libltdl.so.7 (0x0000007f67559000)
+	libminizip.so.1 => /lib/aarch64-linux-gnu/libminizip.so.1 (0x0000007f6753d000)
+	liburiparser.so.1 => /lib/aarch64-linux-gnu/liburiparser.so.1 (0x0000007f67514000)
+	libhdf5_serial_hl.so.100 => /lib/aarch64-linux-gnu/libhdf5_serial_hl.so.100 (0x0000007f674e1000)
+	libsz.so.2 => /lib/aarch64-linux-gnu/libsz.so.2 (0x0000007f674ce000)
+	libssl.so.1.1 => /lib/aarch64-linux-gnu/libssl.so.1.1 (0x0000007f67432000)
+	libldap_r-2.4.so.2 => /lib/aarch64-linux-gnu/libldap_r-2.4.so.2 (0x0000007f673d0000)
+	libsqlite3.so.0 => /lib/aarch64-linux-gnu/libsqlite3.so.0 (0x0000007f6729d000)
+	libnghttp2.so.14 => /lib/aarch64-linux-gnu/libnghttp2.so.14 (0x0000007f67266000)
+	librtmp.so.1 => /lib/aarch64-linux-gnu/librtmp.so.1 (0x0000007f6723a000)
+	libssh.so.4 => /lib/aarch64-linux-gnu/libssh.so.4 (0x0000007f671c0000)
+	libpsl.so.5 => /lib/aarch64-linux-gnu/libpsl.so.5 (0x0000007f6719d000)
+	liblber-2.4.so.2 => /lib/aarch64-linux-gnu/liblber-2.4.so.2 (0x0000007f6717e000)
+	libbrotlidec.so.1 => /lib/aarch64-linux-gnu/libbrotlidec.so.1 (0x0000007f67163000)
+	libfyut.so.0 => /lib/aarch64-linux-gnu/libfyut.so.0 (0x0000007f67149000)
+	libfygm.so.0 => /lib/aarch64-linux-gnu/libfygm.so.0 (0x0000007f67133000)
+	libsystemd.so.0 => /lib/aarch64-linux-gnu/libsystemd.so.0 (0x0000007f67075000)
+	libblkid.so.1 => /lib/aarch64-linux-gnu/libblkid.so.1 (0x0000007f6700f000)
+	libpcre2-8.so.0 => /lib/aarch64-linux-gnu/libpcre2-8.so.0 (0x0000007f66f81000)
+	libdatrie.so.1 => /lib/aarch64-linux-gnu/libdatrie.so.1 (0x0000007f66f69000)
+	libwayland-server.so.0 => /lib/aarch64-linux-gnu/libwayland-server.so.0 (0x0000007f66f45000)
+	libX11-xcb.so.1 => /lib/aarch64-linux-gnu/libX11-xcb.so.1 (0x0000007f66f31000)
+	libxcb-dri2.so.0 => /lib/aarch64-linux-gnu/libxcb-dri2.so.0 (0x0000007f66f1c000)
+	libbsd.so.0 => /lib/aarch64-linux-gnu/libbsd.so.0 (0x0000007f66ef5000)
+	libgomp.so.1 => /lib/aarch64-linux-gnu/libgomp.so.1 (0x0000007f66ea7000)
+	libkrb5.so.3 => /lib/aarch64-linux-gnu/libkrb5.so.3 (0x0000007f66dbf000)
+	libk5crypto.so.3 => /lib/aarch64-linux-gnu/libk5crypto.so.3 (0x0000007f66d82000)
+	libcom_err.so.2 => /lib/aarch64-linux-gnu/libcom_err.so.2 (0x0000007f66d6e000)
+	libkrb5support.so.0 => /lib/aarch64-linux-gnu/libkrb5support.so.0 (0x0000007f66d51000)
+	libgfortran.so.5 => /lib/aarch64-linux-gnu/libgfortran.so.5 (0x0000007f66bd6000)
+	libnssutil3.so => /lib/aarch64-linux-gnu/libnssutil3.so (0x0000007f66b94000)
+	libplc4.so => /lib/aarch64-linux-gnu/libplc4.so (0x0000007f66b7f000)
+	libplds4.so => /lib/aarch64-linux-gnu/libplds4.so (0x0000007f66b6b000)
+	libaec.so.0 => /lib/aarch64-linux-gnu/libaec.so.0 (0x0000007f66b54000)
+	libsasl2.so.2 => /lib/aarch64-linux-gnu/libsasl2.so.2 (0x0000007f66b29000)
+	libgssapi.so.3 => /lib/aarch64-linux-gnu/libgssapi.so.3 (0x0000007f66ad8000)
+	libbrotlicommon.so.1 => /lib/aarch64-linux-gnu/libbrotlicommon.so.1 (0x0000007f66aa7000)
+	liblz4.so.1 => /lib/aarch64-linux-gnu/liblz4.so.1 (0x0000007f66a79000)
+	libkeyutils.so.1 => /lib/aarch64-linux-gnu/libkeyutils.so.1 (0x0000007f66a64000)
+	libheimntlm.so.0 => /lib/aarch64-linux-gnu/libheimntlm.so.0 (0x0000007f66a48000)
+	libkrb5.so.26 => /lib/aarch64-linux-gnu/libkrb5.so.26 (0x0000007f669ac000)
+	libasn1.so.8 => /lib/aarch64-linux-gnu/libasn1.so.8 (0x0000007f66906000)
+	libhcrypto.so.4 => /lib/aarch64-linux-gnu/libhcrypto.so.4 (0x0000007f668bf000)
+	libroken.so.18 => /lib/aarch64-linux-gnu/libroken.so.18 (0x0000007f66899000)
+	libwind.so.0 => /lib/aarch64-linux-gnu/libwind.so.0 (0x0000007f6685e000)
+	libheimbase.so.1 => /lib/aarch64-linux-gnu/libheimbase.so.1 (0x0000007f6683f000)
+	libhx509.so.5 => /lib/aarch64-linux-gnu/libhx509.so.5 (0x0000007f667e5000)
+	libcrypt.so.1 => /lib/aarch64-linux-gnu/libcrypt.so.1 (0x0000007f6679c000)
